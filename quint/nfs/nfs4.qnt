@@ -2208,9 +2208,12 @@ module nfs4 {
     }
 
     // CLONE reflinks a source range into another file.  A minority of draws
-    // use the anonymous stateid, which CLONE must reject with
-    // NFS4ERR_BAD_STATEID -- it resolves both stateids as concrete state and
-    // takes no special-stateid shortcut.
+    // use the anonymous stateid as the source selector instead of the open
+    // stateid: cloneSidGate accepts SelAnon/SelBypass outright (RFC 7862
+    // 15.13.3 lets CLONE take the special stateids, unlike the single-FH I/O
+    // ops' access-mode check), so this exercises that acceptance path rather
+    // than any error -- the share-deny check downstream (anyDeny) is what can
+    // still turn a bypass draw into NFS4ERR_ACCESS.
     action cloneRange = all {
         MINOR >= 2,
         genReady,
@@ -2222,9 +2225,9 @@ module nfs4 {
             nondet srcOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet dstOff = oneOf(0.to(MAX_BLOCKS - 1))
             nondet cnt = oneOf(0.to(2))
-            // As above: one clone in four uses the anonymous stateid so the
-            // BAD_STATEID rejection is covered without starving the success
-            // path.
+            // As above: one clone in four uses the anonymous stateid to
+            // exercise CLONE's special-stateid acceptance path alongside the
+            // ordinary open-stateid path, without starving either.
             nondet anonDraw = oneOf(0.to(3))
             val anon = (anonDraw == 0)
             val srcSel = if (anon) SelAnon else openSel(p.src)
@@ -2688,6 +2691,54 @@ module nfs4 {
                 RCopy({srcSel: SelAnon, dstSel: SelAnon, srcOff: 0, dstOff: 1, cnt: 2})])))
             .then(runC(withSess(0, [RPutfh(2), RRead({sel: SelAnon, off: 0, len: 3})])))
 
+    // CLONE naming a real OPEN stateid, but against the wrong filehandle.
+    // cloneSidGate resolves the SelRef via checkSid (which succeeds -- the
+    // stateid was genuinely allocated) and then compares the file the
+    // stateid names against the operation's filehandle (fOf != fh), so
+    // this is NFS4ERR_BAD_STATEID for a different reason than an unknown
+    // sid: a stateid that is valid, just not for this file (RFC 8881
+    // 8.2.3). This replaces an earlier variant that referenced sid 99,
+    // a sid number this run never hands out -- that is not reachable by
+    // the live server (it can't be resolved to an actual wire stateid by
+    // the MBT replayer), so it only ever exercised the Quint oracle, never
+    // the production CLONE path. Using a real stateid acquired through
+    // OPEN keeps this scenario replayable end-to-end.
+    //
+    // SAVED_FH ("src") and CURRENT_FH ("dst") are kept distinct from each
+    // other, and both distinct from the file the stateid actually names
+    // ("third"), so this exercises a single isolated condition: a
+    // genuinely valid stateid used with the wrong filehandle. Using a
+    // common filehandle for both CLONE endpoints would additionally trip
+    // Chimera's same-file overlap check (RFC 7862 15.13.3) ahead of
+    // stateid validation, conflating two independently-valid errors
+    // (NFS4ERR_INVAL vs. NFS4ERR_BAD_STATEID) whose relative precedence
+    // the RFC does not define -- undermining this regression's purpose of
+    // pinning down BAD_STATEID specifically.
+    run cloneBadStateidRegression =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 3, oseq: 0, claim: OCNull("third"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh])))
+            // SAVED_FH is "src" (fh 1), CURRENT_FH is "dst" (fh 2) -- two
+            // distinct files, so no overlap check can fire -- but the
+            // source selector names the OPEN stateid for "third" (fh 3): a
+            // valid stateid used with the wrong filehandle.
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: SelRef({sid: 2, kind: KOpen, argSeq: 0}),
+                        dstSel: SelAnon,
+                        srcOff: 0, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == E_BAD_STATEID
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+
     // SECINFO of an over-long name.  The random walk reaches it only when
     // nsBadName draws both its SECINFO arm and NLONG (one draw in 133), which
     // the old corpus did twice and a corpus with lockIo in the mix did not
@@ -2877,5 +2928,277 @@ module nfs4 {
                         | LLeaseLost(x) => false
                     })
     }
+
+    // CLONE sourced from a granted READ delegation's stateid, pinned without
+    // the random walk.  coverageBootRun's CREATE_SESSION already asserts the
+    // backchannel, so client 0's first eligible OPEN grants its delegation
+    // immediately (K1, nfs4_deleg_probe.c) rather than on a second open --
+    // the only way to reach a delegation stateid deterministically in one
+    // shot.  Owner 1 opens "src" for READ only, which delegGrant hands a
+    // READ delegation (DRead, not DWrite: othersOpenWrite/otherWriteDeleg are
+    // both false on a fresh file, so the access==1 branch is taken over the
+    // access>=2 one).  Owner 2 opens "dst" the same way.  sids are assigned
+    // by one global counter in open/lock/deleg order, so this is exactly
+    // reproducible: 0 is src's open stateid, 1 is the delegation just
+    // granted on src, 2 is dst's open stateid.  The CLONE then names that
+    // delegation stateid (seqid 0, never bumped: cl_count == 0) as its
+    // source -- a stateid cloneSidGate accepts like any other KDeleg
+    // selector -- and dst's own open stateid as its destination.  Nothing
+    // here is a deviation: RFC 7862 has no carve-out for a delegation
+    // stateid as a CLONE source, so OK is the only conformant answer.
+    run cloneDelegSourceCrash =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: delegSel(1), dstSel: openSel(2),
+                        srcOff: 0, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+            // cnt: 0 on a freshly-created, still-empty src derives to a
+            // zero-length clone (RFC 7862 15.13.3): a true no-op, so both
+            // files stay at size 0.
+            .expect(fsGet(fs, 1).sizeBlocks == 0 and
+                    fsGet(fs, 2).sizeBlocks == 0)
+
+    // Same shape as cloneDelegSourceCrash, but cl_count != 0: the source
+    // range is a bounded extent rather than "to EOF".  CLONE must not treat
+    // a delegation source stateid specially based on cnt -- the stateid
+    // validation and the range semantics are orthogonal -- so this is still
+    // OK.  Between granting the delegation and issuing CLONE, 2 blocks are
+    // written through the anonymous stateid (SelAnon write bypasses share
+    // mode entirely, per opWrite's IoAnon arm) so the source has enough
+    // content for a bounded, nonzero-count clone to stay in range; without
+    // it, every clone of a freshly-created zero-length file would draw
+    // NFS4ERR_INVAL regardless of the stateid under test.  The write and
+    // clone counts stay within MAX_BLOCKS (6) like every other block-level
+    // draw in this model.
+    run cloneDelegSourceNonzeroCount =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(1),
+                RWrite({sel: SelAnon, off: 0, len: 2, pat: 1, stable: 2})])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh])))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: delegSel(1), dstSel: openSel(2),
+                        srcOff: 0, dstOff: 0, cnt: 2})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+            // Reflink content check: dst ("file" 2) picks up src's two
+            // written blocks verbatim, src is untouched, and both sizes
+            // match what fsCopyBlocks/fsWrite computed. This is the Quint
+            // filesystem model's own bookkeeping, not server-side proof --
+            // the READ below is what actually exercises the live server.
+            .expect(fsGet(fs, 1).sizeBlocks == 2 and
+                    fsGet(fs, 1).blocks.get(0) == BData(1) and
+                    fsGet(fs, 1).blocks.get(1) == BData(1) and
+                    fsGet(fs, 2).sizeBlocks == 2 and
+                    fsGet(fs, 2).blocks.get(0) == BData(1) and
+                    fsGet(fs, 2).blocks.get(1) == BData(1))
+            // Real data verification: READ the destination back through the
+            // live server (the MBT replayer issues this RPC and checks the
+            // actual bytes), not just the model's internal fs assertion
+            // above.
+            .then(runC(withSess(0, [RPutfh(2),
+                RRead({sel: SelAnon, off: 0, len: 2})])))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == OK and
+                            (match l.results[2] {
+                                 | SRead(x) => x.blocks == [1, 1]
+                                 | _ => false
+                             })
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+
+    // Destination is a granted WRITE delegation's stateid, cl_count == 0.
+    // Owner 1 opens "src" read-only (ordinary open stateid, used as source);
+    // that OPEN also earns src a READ delegation (same as
+    // cloneDelegSourceCrash, since access == 1 and the file has no other
+    // opens/delegations).  Owner 2 then opens "dst" for read+write
+    // (access: 3), which delegGrant hands a WRITE delegation (DWrite)
+    // because access >= 2 and dst has no other opens/delegations either.
+    // sids: 0 is src's open stateid, 1 is src's READ delegation, 2 is dst's
+    // open stateid, 3 is the WRITE delegation just granted on dst.  CLONE
+    // writes into dst, so a WRITE-valid delegation stateid as the
+    // destination is exactly the case CLONE must accept.
+    run cloneDelegDestWriteZeroCount =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(3) and
+                    sdb.delegs.get(3).file == 2 and
+                    sdb.delegs.get(3).isWrite)
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: openSel(0), dstSel: delegSel(3),
+                        srcOff: 0, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+            // cnt: 0 on a still-empty src is a no-op: both files stay at
+            // size 0.
+            .expect(fsGet(fs, 1).sizeBlocks == 0 and
+                    fsGet(fs, 2).sizeBlocks == 0)
+
+    // Same as cloneDelegDestWriteZeroCount, but cl_count != 0.  As in
+    // cloneDelegSourceNonzeroCount, src needs enough content for a bounded
+    // clone to stay in range, written through the anonymous stateid so the
+    // read-only open on src is untouched.  The write and clone counts stay
+    // within MAX_BLOCKS (6) like every other block-level draw in this model.
+    run cloneDelegDestWriteNonzeroCount =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(1),
+                RWrite({sel: SelAnon, off: 0, len: 2, pat: 1, stable: 2})])))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(3) and
+                    sdb.delegs.get(3).file == 2 and
+                    sdb.delegs.get(3).isWrite)
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: openSel(0), dstSel: delegSel(3),
+                        srcOff: 0, dstOff: 0, cnt: 2})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+            // Reflink content check: dst picks up src's two written blocks
+            // verbatim, src is untouched, sizes match. This is the Quint
+            // filesystem model's own bookkeeping, not server-side proof --
+            // the READ below is what actually exercises the live server.
+            .expect(fsGet(fs, 1).sizeBlocks == 2 and
+                    fsGet(fs, 1).blocks.get(0) == BData(1) and
+                    fsGet(fs, 1).blocks.get(1) == BData(1) and
+                    fsGet(fs, 2).sizeBlocks == 2 and
+                    fsGet(fs, 2).blocks.get(0) == BData(1) and
+                    fsGet(fs, 2).blocks.get(1) == BData(1))
+            // Real data verification: READ the destination back through the
+            // live server (the MBT replayer issues this RPC and checks the
+            // actual bytes), not just the model's internal fs assertion
+            // above.
+            .then(runC(withSess(0, [RPutfh(2),
+                RRead({sel: SelAnon, off: 0, len: 2})])))
+            .expect(match lastOp {
+                        | LCompound(l) =>
+                            l.status == OK and
+                            (match l.results[2] {
+                                 | SRead(x) => x.blocks == [1, 1]
+                                 | _ => false
+                             })
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+
+    // Both source and destination are delegation stateids: src's READ
+    // delegation and dst's WRITE delegation, granted on first OPEN for each
+    // (owner 1 access: 1 on "src", owner 2 access: 3 on "dst").  sids: 0 is
+    // src's open stateid, 1 is src's READ delegation, 2 is dst's open
+    // stateid, 3 is dst's WRITE delegation.
+    run cloneBothDelegStateids =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(3) and
+                    sdb.delegs.get(3).file == 2 and
+                    sdb.delegs.get(3).isWrite)
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: delegSel(1), dstSel: delegSel(3),
+                        srcOff: 0, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == OK
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
+            // cnt: 0 on a still-empty src is a no-op: both files stay at
+            // size 0.
+            .expect(fsGet(fs, 1).sizeBlocks == 0 and
+                    fsGet(fs, 2).sizeBlocks == 0)
+
+    // Destination named by a READ-only delegation stateid: CLONE writes
+    // into its destination, so a READ delegation cannot satisfy that --
+    // RFC 7862 15.13.3's access-mode check (echoing 18.22.3 and 18.32.3)
+    // demands the destination's state grant WRITE access, and a READ
+    // delegation does not.  Both opens are read-only (access: 1), so each
+    // earns a READ delegation rather than a WRITE one.  sids: 0 is src's
+    // open stateid, 1 is src's READ delegation, 2 is dst's open stateid, 3
+    // is dst's READ delegation.  Expect NFS4ERR_OPENMODE.
+    run cloneDelegDestReadOnlyRejected =
+        coverageBootRun
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(1) and
+                    sdb.delegs.get(1).file == 1 and
+                    not(sdb.delegs.get(1).isWrite))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(3) and
+                    sdb.delegs.get(3).file == 2 and
+                    not(sdb.delegs.get(3).isWrite))
+            .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
+                RClone({srcSel: delegSel(1), dstSel: delegSel(3),
+                        srcOff: 0, dstOff: 0, cnt: 0})])))
+            .expect(match lastOp {
+                        | LCompound(l) => l.status == E_OPENMODE
+                        | LInit(x) => false
+                        | LLeaseLost(x) => false
+                    })
 
 }
