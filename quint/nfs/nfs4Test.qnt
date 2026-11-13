@@ -1004,7 +1004,10 @@ module nfs4Test42 {
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
             .expect(lastStatus == E_BAD_STATEID)
             // Destination endpoint is the layout stateid: BAD_STATEID too.
-            .then(runC([ seq0(7), RPutfh(1), RSavefh, RPutfh(1),
+            // File 2 is only the destination here (not file 1, which would
+            // make this a same-file overlapping-range CLONE and conflate
+            // the stateid check with the overlap check).
+            .then(runC([ seq0(7), RPutfh(2), RSavefh, RPutfh(1),
                          RClone({ srcSel: SelAnon,
                                   dstSel: SelRef({ sid: 2, kind: KLayout,
                                                     argSeq: 0 }),
@@ -1121,9 +1124,8 @@ module nfs4Test42 {
             .expect(lastStatus == E_UNION_NOTSUPP)
             // CLONE accepts the special stateids like COPY does: the server
             // derives the access check from the filehandles, and any share
-            // reservation gets enforced separately (NFS4ERR_ACCESS, the
-            // RFC-sanctioned stand-in for CLONE's missing NFS4ERR_LOCKED --
-            // see opClone's comment) below.
+            // reservation gets enforced separately (NFS4ERR_LOCKED, tolerating
+            // NFS4ERR_ACCESS -- see opClone's comment) below.
             .then(runC([ seq0(9), RPutrootfh,
                          ROpen({ client: 0, owner: 2, oseq: 0,
                                  claim: OCNull("g"),
@@ -1135,7 +1137,7 @@ module nfs4Test42 {
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
             .expect(lastStatus == OK)
             // A deny reservation held by any open still gates the special
-            // stateids: a READ open of a third file ("h") by a second
+            // stateids: a READ open of a third file ("h") by a third
             // open-owner of client 0, with deny=WRITE, blocks an anonymous
             // CLONE that would write to it. (A cross-client variant is
             // covered separately in cloneCrossClientDenyTest.)
@@ -1149,14 +1151,14 @@ module nfs4Test42 {
             .then(runC([ seq0(12), RPutfh(1), RSavefh, RPutfh(3),
                          RClone({ srcSel: SelAnon, dstSel: SelAnon,
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
-            .expect(lastStatus == E_ACCESS)
+            .expect(lastStatus == E_LOCKED)
             .expect(fsGet(fs, 3).sizeBlocks == 0)
             // The same deny also blocks the bypass stateid used as the
             // destination selector.
             .then(runC([ seq0(13), RPutfh(1), RSavefh, RPutfh(3),
                          RClone({ srcSel: SelBypass, dstSel: SelBypass,
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
-            .expect(lastStatus == E_ACCESS)
+            .expect(lastStatus == E_LOCKED)
             .expect(fsGet(fs, 3).sizeBlocks == 0)
 
     // CLONE's special-stateid share-deny check (opClone) looks at every
@@ -1200,14 +1202,14 @@ module nfs4Test42 {
             .then(runC([ seq0(3), RPutfh(1), RSavefh, RPutfh(2),
                          RClone({ srcSel: SelAnon, dstSel: SelAnon,
                                   srcOff: 0, dstOff: 0, cnt: 1 }) ]))
-            .expect(lastStatus == E_ACCESS)
+            .expect(lastStatus == E_LOCKED)
             .expect(fsGet(fs, 2).sizeBlocks == 0)
 
-    // RFC 7862 15.13.3 derives CLONE's range rules from COPY's (15.2.3),
-    // which requires NFS4ERR_INVAL when the source offset exceeds the
-    // source file's size -- with no exception for ca_count == 0. This
-    // exercises all three boundary cases (before, exactly at, and beyond
-    // EOF) against the fixed opClone oracle. "f" ends up 2 blocks long.
+    // RFC 7862 15.13.3 requires NFS4ERR_INVAL when the source offset
+    // exceeds the source file's size -- with no exception for cl_count == 0.
+    // This exercises all three boundary cases (before, exactly at, and
+    // beyond EOF) against the fixed opClone oracle. "f" ends up 2 blocks
+    // long.
     run cloneSrcOffsetEofBoundaryTest =
         openCreateRun
             .then(runC([ seq0(2), RPutfh(1),

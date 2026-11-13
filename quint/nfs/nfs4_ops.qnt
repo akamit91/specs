@@ -3172,72 +3172,28 @@ emit(a,
         }
     }
 
-    // CLONE resolves both stateids through the state table, which does not
-    // accept the special stateids (they name no concrete state).  Unlike the
-    // single-filehandle I/O ops, the two stateids are validated against
-    // DIFFERENT filehandles -- the source against the saved FH and the
-    // destination against the current one -- so this cannot reuse resolveSel,
-    // which always checks against the current FH.
+    // CLONE judges each endpoint's stateid exactly like COPY
+    // (copySidGate), with one addition: a layout stateid names no
+    // open/lock/delegation access mode at all (RFC 8881 12.5.3: layout
+    // stateids control pNFS layout recall, not I/O authorization), so RFC
+    // 8881 8.2.4 ("stateid type is not valid for the context in which the
+    // stateid appears") makes it NFS4ERR_BAD_STATEID here rather than a
+    // validly-resolved stateid that merely fails the access-mode check
+    // (which would be NFS4ERR_OPENMODE).
     pure def cloneSidGate(a: Acc, sel: SidSel, fh: Ino, needWrite: bool): int =
         match sel {
-            | SelAnon => OK
-            | SelBypass => OK
-            | SelRef(r) =>
-                match checkSid(a.sdb, r.sid, r.kind, r.argSeq) {
-                    | SidBad => E_BAD_STATEID
-                    | SidOld => E_OLD_STATEID
-                    | SidOk =>
-                        // A layout stateid names no open/lock/delegation
-                        // access mode at all (RFC 8881 12.5.2: layout
-                        // stateids control pNFS layout recall, not I/O
-                        // authorization).  CLONE's general stateid-validity
-                        // rule (RFC 7862 15.13.3 -> RFC 8881 8.2.5) excludes
-                        // layout stateids from the set of stateids valid for
-                        // I/O, so one here is NFS4ERR_BAD_STATEID -- not a
-                        // validly-resolved stateid that merely fails the
-                        // access-mode check (which would be NFS4ERR_OPENMODE).
-                        if (r.kind == KLayout) E_BAD_STATEID
-                        else {
-                            val fOf = match r.kind {
-                                | KOpen => a.sdb.opens.get(r.sid).file
-                                | KLock => a.sdb.locks.get(r.sid).file
-                                | KDeleg => a.sdb.delegs.get(r.sid).file
-                                | KLayout => a.sdb.layouts.get(r.sid).file
-                            }
-                            val ownedBy = match r.kind {
-                                | KOpen => a.sdb.opens.get(r.sid).client
-                                | KLock => a.sdb.locks.get(r.sid).client
-                                | KDeleg => a.sdb.delegs.get(r.sid).client
-                                | KLayout => a.sdb.layouts.get(r.sid).client
-                            }
-                            val mode = match r.kind {
-                                | KOpen => a.sdb.opens.get(r.sid).access
-                                | KLock => a.sdb.opens.get(a.sdb.locks.get(r.sid).openSid).access
-                                | KDeleg => if (a.sdb.delegs.get(r.sid).isWrite) 3 else 1
-                                | KLayout => 0
-                            }
-                            if (fOf != fh) E_BAD_STATEID
-                            else if (a.minor >= 1 and a.seqClient != -1 and
-                                     ownedBy != a.seqClient)
-                                E_BAD_STATEID
-                            else if (r.kind == KOpen and
-                                     a.sdb.opens.get(r.sid).needConfirm)
-                                E_BAD_STATEID
-                            else if (not(bitsOverlap(mode,
-                                                     if (needWrite) 2 else 1)))
-                                E_OPENMODE
-                            else OK
-                        }
-                }
+            | SelRef(r) => if (r.kind == KLayout) E_BAD_STATEID
+                           else copySidGate(a, sel, fh, needWrite)
+            | _ => copySidGate(a, sel, fh, needWrite)
         }
 
     // COPY judges each endpoint's stateid like the single-FH I/O ops, but
     // against a different filehandle: the source for READ against the saved
-    // FH, the destination for WRITE against the current one.  Unlike CLONE,
-    // COPY accepts the special stateids (the server derives the access check
-    // from the filehandles, copyTest pins it) -- a special stateid returns OK
-    // here and the deny-reservation (NFS4ERR_LOCKED) check downstream covers
-    // it.  A named stateid of the wrong file or another client is
+    // FH, the destination for WRITE against the current one.  COPY and
+    // CLONE both accept the special stateids (the server derives the access
+    // check from the filehandles, copyTest pins it) -- a special stateid
+    // returns OK here and the deny-reservation check downstream covers it.
+    // A named stateid of the wrong file or another client is
     // NFS4ERR_BAD_STATEID, and one that lacks the needed mode (a read-only
     // open or, for the destination, a read delegation) is NFS4ERR_OPENMODE.
     pure def copySidGate(a: Acc, sel: SidSel, fh: Ino, needWrite: bool): int =
@@ -3595,14 +3551,15 @@ emit(a,
         }
     }
 
-    // CLONE (RFC 7862 15.4) reflinks a source range (sfh) into the
+    // CLONE (RFC 7862 15.13) reflinks a source range (sfh) into the
     // destination (cfh); the ranges then share storage copy-on-write, which
     // is invisible at the protocol level -- the observable effect is a COPY.
     // cl_count == 0 clones through the source EOF, and a source offset at or
-    // past EOF is a no-op success.  Unlike COPY, CLONE resolves both stateids
-    // as concrete open/lock state: it takes no special-stateid shortcut, so
-    // an anonymous or read-bypass selector is NFS4ERR_BAD_STATEID.  Cloning
-    // overlapping ranges of one file is NFS4ERR_INVAL.
+    // past EOF is a no-op success.  CLONE accepts the special stateids, like
+    // COPY (cloneSidGate mirrors copySidGate): a named stateid of the wrong
+    // file or another client is NFS4ERR_BAD_STATEID, and one that lacks the
+    // needed mode is NFS4ERR_OPENMODE.  Cloning overlapping ranges of one
+    // file is NFS4ERR_INVAL.
     pure def opClone(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                    srcOff: int, dstOff: int, cnt: int }): Acc = {
         if (a.minor < 2) emit(a, SClone({ st: E_OP_ILLEGAL , stAccept: Set(E_OP_ILLEGAL) }))
@@ -3638,57 +3595,33 @@ emit(a,
                         ar.srcOff < ar.dstOff + cnt and
                         ar.dstOff < ar.srcOff + cnt)
                         emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))
-                    // CLONE reads the source and writes the destination, so
-                    // the share reservations that gate READ and WRITE gate
-                    // it too (RFC 8881 8.2.4), the same as COPY. A stateid
-                    // that names an open carries its own grant; an
-                    // anonymous or READ-bypass one does not, so a deny held
-                    // by any owner of any client must still refuse the I/O --
-                    // otherwise the special stateid would be a way around
-                    // the reservation.
-                    //
-                    // For plain READ/WRITE, RFC 8881 8.2.4 mandates
-                    // NFS4ERR_LOCKED for exactly this conflict. CLONE is
-                    // different: RFC 7862 15.13.3 says its stateids "follow
-                    // the rules ... in Sections 8.2.5 and 18.22.3/18.32.3"
-                    // (general stateid validity), but CLONE's own valid-error
-                    // table (RFC 7862 11.2) omits NFS4ERR_LOCKED -- unlike
-                    // COPY, whose table includes it. That omission looks
-                    // deliberate rather than an oversight: COPY's table
-                    // already demonstrates the authors knew to list LOCKED
-                    // where it applies. Since a conformant server MUST NOT
-                    // return a status outside an operation's valid-error
-                    // table, CLONE cannot signal this conflict with LOCKED.
-                    // NFS4ERR_ACCESS is in CLONE's table and is the generic
-                    // "operation not permitted on this stateid/file" status,
-                    // so it is used here as the closest RFC-sanctioned
-                    // stand-in for a share-reservation conflict. This is a
-                    // documented interpretation, not an RFC-unambiguous
-                    // answer: the RFC does not give a worked example of a
-                    // special-stateid CLONE hitting a conflicting deny.
-                    // Checked before the no-op/range outcomes since the
-                    // reservation conflict exists regardless of whether any
-                    // bytes actually move -- an access-control refusal
-                    // outranks an argument-range refusal.
+                    // Share reservations gate CLONE's source read and
+                    // destination write as they gate READ/WRITE (RFC 7862
+                    // 15.13.3 -> RFC 8881 18.22.3/18.32.3, 9.1.2): a special
+                    // stateid carries no grant of its own, so any open's
+                    // deny refuses it. RFC 7862 11.2 omits LOCKED from
+                    // CLONE's errors, so ACCESS is tolerated too.
+                    // Checked after the same-file overlap arm, before the
+                    // EOF range checks.
                     else if (namesNoOpen(ar.srcSel) and anyDeny(a.sdb, a.sfh, 1))
-                        emit(a, SClone({ st: E_ACCESS , stAccept: Set(E_ACCESS) }))
+                        emit(a, SClone({ st: E_LOCKED , stAccept: Set(E_LOCKED, E_ACCESS) }))
                     else if (namesNoOpen(ar.dstSel) and anyDeny(a.sdb, a.cfh, 2))
-                        emit(a, SClone({ st: E_ACCESS , stAccept: Set(E_ACCESS) }))
+                        emit(a, SClone({ st: E_LOCKED , stAccept: Set(E_LOCKED, E_ACCESS) }))
                     // A source offset beyond the source file's size is
-                    // invalid regardless of cl_count (RFC 7862 15.13.3
-                    // derives CLONE's range rules from COPY's, 15.2.3,
-                    // which requires NFS4ERR_INVAL when ca_src_offset
-                    // exceeds the source size -- the RFC draws no
-                    // exception for ca_count == 0). This subsumes the
+                    // invalid regardless of cl_count (RFC 7862 15.13.3: "If
+                    // the source offset or the source offset plus count is
+                    // greater than the size of the source file, the
+                    // operation MUST fail with NFS4ERR_INVAL" -- no
+                    // exception for cl_count == 0). This subsumes the
                     // explicit-count range check below whenever the
                     // offset itself is already past EOF; the second
                     // check additionally catches an in-bounds offset
                     // whose explicit count runs past EOF.
                     //
-                    // chimera_nfs4_clone_getattr_complete distinguishes an
-                    // offset strictly past EOF (NFS4ERR_INVAL) from one
-                    // exactly at EOF (a zero-length no-op success), matching
-                    // this oracle; see cloneSrcOffsetEofBoundaryTest in
+                    // The reference implementation distinguishes an offset
+                    // strictly past EOF (NFS4ERR_INVAL) from one exactly at
+                    // EOF (a zero-length no-op success), matching this
+                    // oracle; see cloneSrcOffsetEofBoundaryTest in
                     // nfs4Test.qnt for the exhaustive boundary coverage.
                     else if (ar.srcOff > src.sizeBlocks)
                         emit(a, SClone({ st: E_INVAL , stAccept: Set(E_INVAL) }))

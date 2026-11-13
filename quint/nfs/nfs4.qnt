@@ -594,9 +594,9 @@ module nfs4 {
 
     // CLONE pairs: a source open and a destination open held by ONE client
     // on DISTINCT files, the source readable and the destination writable.
-    // CLONE resolves both stateids as concrete open state, so having such a
-    // pair is a precondition of generating the operation at all -- drawing
-    // two opens at random almost never satisfies it.
+    // Having such a pair lets the walk draw a CLONE with real open state on
+    // both ends (CLONE also accepts the special stateids, see cloneRange
+    // below) -- drawing two opens at random almost never satisfies it.
     def clonePairs: Set[{ src: Sid, dst: Sid }] =
         usableOpens.fold(Set(), (acc, sp) => {
             val so = sdb.opens.get(sp)
@@ -2208,12 +2208,11 @@ module nfs4 {
     }
 
     // CLONE reflinks a source range into another file.  A minority of draws
-    // use the anonymous stateid as the source selector instead of the open
-    // stateid: cloneSidGate accepts SelAnon/SelBypass outright (RFC 7862
-    // 15.13.3 lets CLONE take the special stateids, unlike the single-FH I/O
-    // ops' access-mode check), so this exercises that acceptance path rather
-    // than any error -- the share-deny check downstream (anyDeny) is what can
-    // still turn a bypass draw into NFS4ERR_ACCESS.
+    // use the anonymous stateid as the source instead of the open stateid,
+    // which CLONE accepts as READ does (RFC 7862 15.13.3 -> RFC 8881 9.1.2).
+    // Since stepData42 only opens with deny 0, the share-deny refusal
+    // (anyDeny, NFS4ERR_LOCKED) is unreachable from this walk; the named
+    // regressions cover it instead.
     action cloneRange = all {
         MINOR >= 2,
         genReady,
@@ -2697,12 +2696,8 @@ module nfs4 {
     // stateid names against the operation's filehandle (fOf != fh), so
     // this is NFS4ERR_BAD_STATEID for a different reason than an unknown
     // sid: a stateid that is valid, just not for this file (RFC 8881
-    // 8.2.3). This replaces an earlier variant that referenced sid 99,
-    // a sid number this run never hands out -- that is not reachable by
-    // the live server (it can't be resolved to an actual wire stateid by
-    // the MBT replayer), so it only ever exercised the Quint oracle, never
-    // the production CLONE path. Using a real stateid acquired through
-    // OPEN keeps this scenario replayable end-to-end.
+    // 8.2.4). Using a real stateid acquired through OPEN keeps this
+    // scenario replayable end-to-end against the live server.
     //
     // SAVED_FH ("src") and CURRENT_FH ("dst") are kept distinct from each
     // other, and both distinct from the file the stateid actually names
@@ -2937,16 +2932,18 @@ module nfs4 {
     // shot.  Owner 1 opens "src" for READ only, which delegGrant hands a
     // READ delegation (DRead, not DWrite: othersOpenWrite/otherWriteDeleg are
     // both false on a fresh file, so the access==1 branch is taken over the
-    // access>=2 one).  Owner 2 opens "dst" the same way.  sids are assigned
-    // by one global counter in open/lock/deleg order, so this is exactly
-    // reproducible: 0 is src's open stateid, 1 is the delegation just
-    // granted on src, 2 is dst's open stateid.  The CLONE then names that
-    // delegation stateid (seqid 0, never bumped: cl_count == 0) as its
-    // source -- a stateid cloneSidGate accepts like any other KDeleg
-    // selector -- and dst's own open stateid as its destination.  Nothing
-    // here is a deviation: RFC 7862 has no carve-out for a delegation
-    // stateid as a CLONE source, so OK is the only conformant answer.
-    run cloneDelegSourceCrash =
+    // access>=2 one).  Owner 2 opens "dst" with access 3, so dst draws a
+    // WRITE delegation (sid 3).  sids are assigned by one global counter in
+    // open/lock/deleg order, so this is exactly reproducible: 0 is src's
+    // open stateid, 1 is the delegation just granted on src, 2 is dst's
+    // open stateid.  The CLONE then names that delegation stateid (argSeq
+    // 0, the "current seqid" convention -- RFC 8881 8.2.2 -- not related to
+    // cl_count) as its source -- a stateid cloneSidGate accepts like any
+    // other KDeleg selector -- and dst's own open stateid as its
+    // destination.  Nothing here is a deviation: RFC 7862 has no carve-out
+    // for a delegation stateid as a CLONE source, so OK is the only
+    // conformant answer.
+    run cloneDelegSourceZeroCount =
         coverageBootRun
             .then(runC(withSess(0, [RPutfh(ROOT),
                 ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
@@ -2973,35 +2970,57 @@ module nfs4 {
             .expect(fsGet(fs, 1).sizeBlocks == 0 and
                     fsGet(fs, 2).sizeBlocks == 0)
 
-    // Same shape as cloneDelegSourceCrash, but cl_count != 0: the source
+    // Same shape as cloneDelegSourceZeroCount, but cl_count != 0: the source
     // range is a bounded extent rather than "to EOF".  CLONE must not treat
     // a delegation source stateid specially based on cnt -- the stateid
     // validation and the range semantics are orthogonal -- so this is still
-    // OK.  Between granting the delegation and issuing CLONE, 2 blocks are
-    // written through the anonymous stateid (SelAnon write bypasses share
-    // mode entirely, per opWrite's IoAnon arm) so the source has enough
-    // content for a bounded, nonzero-count clone to stay in range; without
-    // it, every clone of a freshly-created zero-length file would draw
-    // NFS4ERR_INVAL regardless of the stateid under test.  The write and
-    // clone counts stay within MAX_BLOCKS (6) like every other block-level
-    // draw in this model.
+    // OK.
+    //
+    // The source needs content before the delegation is granted: writing
+    // through SelAnon *after* client 0 already holds the READ delegation on
+    // "src" is a server-side deviation (RFC 8881 8.2.5's last paragraph) --
+    // the special-stateid WRITE is admitted under the implicit claim, which
+    // never coalesces with the delegation-holding client, so it looks like a
+    // conflicting writer and starts a self-recall that the synchronous
+    // replayer can't service, revoking its own delegation before CLONE runs.
+    // So instead: open "src" read+write first (earning src a WRITE
+    // delegation instead, since access >= 2 and the file has no other
+    // opens/delegations), write 2 blocks through *that* open's own stateid
+    // (not anonymous -- it is unambiguously the delegation holder's own I/O),
+    // close the open and return the WRITE delegation, then re-open "src"
+    // read-only to obtain the READ delegation actually under test. sids: 0 is
+    // the first (read+write) open, 1 its WRITE delegation (both retired
+    // before CLONE), 2 the second (read-only) open, 3 its READ delegation,
+    // 4 is dst's open stateid. The write and clone counts stay within
+    // MAX_BLOCKS (6) like every other block-level draw in this model.
     run cloneDelegSourceNonzeroCount =
         coverageBootRun
             .then(runC(withSess(0, [RPutfh(ROOT),
                 ROpen({client: 0, owner: 1, oseq: 0, claim: OCNull("src"),
-                       how: HGuarded({mode: 420}), access: 1, deny: 0}),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}),
                 RGetfh])))
             .expect(sdb.delegs.keys().contains(1) and
                     sdb.delegs.get(1).file == 1 and
-                    not(sdb.delegs.get(1).isWrite))
+                    sdb.delegs.get(1).isWrite)
             .then(runC(withSess(0, [RPutfh(1),
-                RWrite({sel: SelAnon, off: 0, len: 2, pat: 1, stable: 2})])))
+                RWrite({sel: openSel(0), off: 0, len: 2, pat: 1, stable: 2})])))
+            .then(runC(withSess(0, [RPutfh(1),
+                RClose({sid: 0, argSeq: 0, oseq: oseqFor(0, 1)})])))
+            .then(runC(withSess(0, [RPutfh(1),
+                RDelegreturn({sid: 1, kind: KDeleg, argSeq: 0})])))
             .then(runC(withSess(0, [RPutfh(ROOT),
-                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("dst"),
+                ROpen({client: 0, owner: 2, oseq: 0, claim: OCNull("src"),
+                       how: HNoCreate, access: 1, deny: 0}),
+                RGetfh])))
+            .expect(sdb.delegs.keys().contains(3) and
+                    sdb.delegs.get(3).file == 1 and
+                    not(sdb.delegs.get(3).isWrite))
+            .then(runC(withSess(0, [RPutfh(ROOT),
+                ROpen({client: 0, owner: 3, oseq: 0, claim: OCNull("dst"),
                        how: HGuarded({mode: 420}), access: 3, deny: 0}),
                 RGetfh])))
             .then(runC(withSess(0, [RPutfh(1), RSavefh, RPutfh(2),
-                RClone({srcSel: delegSel(1), dstSel: openSel(2),
+                RClone({srcSel: delegSel(3), dstSel: openSel(4),
                         srcOff: 0, dstOff: 0, cnt: 2})])))
             .expect(match lastOp {
                         | LCompound(l) => l.status == OK
@@ -3039,7 +3058,7 @@ module nfs4 {
     // Destination is a granted WRITE delegation's stateid, cl_count == 0.
     // Owner 1 opens "src" read-only (ordinary open stateid, used as source);
     // that OPEN also earns src a READ delegation (same as
-    // cloneDelegSourceCrash, since access == 1 and the file has no other
+    // cloneDelegSourceZeroCount, since access == 1 and the file has no other
     // opens/delegations).  Owner 2 then opens "dst" for read+write
     // (access: 3), which delegGrant hands a WRITE delegation (DWrite)
     // because access >= 2 and dst has no other opens/delegations either.
